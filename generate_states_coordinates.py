@@ -3,7 +3,7 @@ import xlsxwriter
 import os
 
 # --- SETTINGS ---
-INPUT_FILE = 'Ancestors Database_Osama_v01.xlsx'  
+INPUT_FILE = 'Ancestors Database_v01_copy.xlsx'  
 REF_FILE = 'uscounties.csv'
 OUTPUT_FILE = 'Genealogy_Smart_Entry_v3.xlsx'
 

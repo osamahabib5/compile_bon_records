@@ -1,0 +1,6 @@
+.env
+# Python cache directories
+__pycache__/
+*.py[cod]
+# Optional editor files
+.vscode/
