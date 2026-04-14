@@ -3,15 +3,22 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from ollama import Client
+from groq import Groq
+from dotenv import load_dotenv
+
+# Your other imports...
+import os
+
+# Now this will work
+load_dotenv()
 
 # --- 1. Initialization ---
-client = Client(host='http://localhost:11434')
+client = Groq()  # Uses GROQ_API_KEY environment variable automatically
 
 def ollama_validate_and_fix(row):
     """
     Strict Auditor: Compares row data to Notes and returns ONLY values.
-    Uses optimized prompt with detailed instructions for accurate extraction.
+    Uses Groq API with llama-3.1-8b-instant for accurate extraction.
     """
     current_data = row.to_dict()
     
@@ -69,18 +76,23 @@ RESPONSE FORMAT (EXACTLY 14 VALUES SEPARATED BY '|'):
 """
     
     try:
-        response = client.generate(
-            model='qwen2.5:7b',
-            prompt=prompt,
-            options={
-                "num_ctx": 2048,  # Increased for more context
-                "temperature": 0,
-                "num_predict": 200,  # Slightly increased for detailed responses
-                "stop": ["TEXT TO", "INSTRUCTION", "FIELD ORDER", "LOGIC", "RULES", "\n\n"]
-            }
+        # Use Groq API instead of Ollama
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0,  # Deterministic output
+            max_completion_tokens=300,  # Sufficient for 14 values
+            top_p=1,
+            stream=False,  # Don't stream for easier parsing
+            stop=None
         )
         
-        raw_output = response['response'].strip()
+        raw_output = completion.choices[0].message.content.strip()
         
         # Post-Processing: Remove any extra text before the actual values
         # Extract only the pipe-separated values
@@ -119,15 +131,16 @@ RESPONSE FORMAT (EXACTLY 14 VALUES SEPARATED BY '|'):
 # --- 2. Main Execution ---
 def main():
     input_file = 'Consolidated_Directory_v12_subset.xlsx' 
-    output_file = 'Consolidated_Directory_v12_ollama.xlsx'
+    output_file = 'Validated_Records_Fixed.xlsx'
     
     df = pd.read_excel(input_file)
-    print(f"Validating {len(df)} records. Applying Optimized Extraction Protocol...")
+    print(f"Validating {len(df)} records using Groq API (llama-3.1-8b-instant)...")
     print(f"Total records to process: {len(df)}\n")
     
     start_time = time.time()
     
-    # Process with 2 workers for i5 stability
+    # Process with 2 workers for stability
+    # Note: Groq has rate limits (30 requests/minute), adjust workers if needed
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(tqdm(
             executor.map(ollama_validate_and_fix, [row for _, row in df.iterrows()]), 
@@ -187,6 +200,7 @@ def main():
     print(f"Records Processed: {len(df)}")
     print(f"Output File: {output_file}")
     print(f"Processing Rate: {round(len(df)/elapsed_time, 2)} records/second")
+    print(f"\n⚠️  Note: Groq API has limits - 30 requests/minute, 14.4K/day")
 
 if __name__ == "__main__":
     main()
