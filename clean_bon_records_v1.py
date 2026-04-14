@@ -1,94 +1,192 @@
 import pandas as pd
-import spacy
 import re
-from thefuzz import fuzz, process
+import time
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+from ollama import Client
 
-# Load spaCy
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+# --- 1. Initialization ---
+client = Client(host='http://localhost:11434')
 
-# --- 1. Load Files ---
-FILE_PATH = 'Consolidated_Directory.xlsx'
-df = pd.read_excel(FILE_PATH)
-
-# --- 2. Helper Logic ---
-
-def get_combined_name(first, last):
-    """Joins names into a single lowercase string for comparison."""
-    f = str(first).strip().lower() if pd.notna(first) and str(first) != "-" else ""
-    l = str(last).strip().lower() if pd.notna(last) and str(last) != "-" else ""
-    return f"{f} {l}".strip()
-
-def find_best_truth_match(inc_row, truth_df):
+def ollama_validate_and_fix(row):
     """
-    Implements the tiered matching logic:
-    1. Fuzzy Ship Match
-    2. Tie-break with Commander if needed
+    Strict Auditor: Compares row data to Notes and returns ONLY values.
+    Uses optimized prompt with detailed instructions for accurate extraction.
     """
-    inc_ship = str(inc_row['Ship_Name']).lower()
-    inc_cmd = str(inc_row['Commander']).lower() if pd.notna(inc_row['Commander']) else ""
-
-    # Get unique correct ship names
-    truth_ships = truth_df['Ship_Name'].unique()
+    current_data = row.to_dict()
     
-    # Fuzzy match the ship name (handles Amities vs Amity's)
-    best_ship, ship_score = process.extractOne(inc_ship, truth_ships, scorer=fuzz.token_sort_ratio)
-
-    if ship_score < 85: # Threshold for "somewhat similar"
-        return None
-
-    # Filter truth records by that ship
-    potential_matches = truth_df[truth_df['Ship_Name'] == best_ship]
-
-    # Tie-breaker: If ship exists in multiple books/entries, match Commander
-    if len(potential_matches['Book'].unique()) > 1 or len(potential_matches) > 1:
-        truth_commanders = potential_matches['Commander'].unique()
-        best_cmd, cmd_score = process.extractOne(inc_cmd, truth_commanders, scorer=fuzz.token_sort_ratio)
-        return potential_matches[potential_matches['Commander'] == best_cmd].iloc[0]
+    # Prepare context with all available information
+    context = (
+        f"Notes: {current_data.get('Notes', '-')}\n"
+        f"Ship_Notes: {current_data.get('Ship_Notes', '-')}"
+    )
     
-    return potential_matches.iloc[0]
+    # OPTIMIZED PROMPT with detailed instructions
+    prompt = f"""### INSTRUCTION
+Extract historical data. Return ONLY values separated by '|'. Use '-' for missing info.
 
-# --- 3. Execution ---
+### FIELD ORDER
+First_Name | Surname | Ship_Name | Arrival_Port | Arrival_Country | Arrival_Coordinates | Extracted_City | Extracted_County | Extracted_State | Extracted_Area | Country | Departure_Coordinates | Commander | Age
 
-# Identify Truth (Book is populated) vs Incorrect (Book is blank)
-truth_mask = df['Book'].notna() & (df['Book'] != "") & (df['Book'] != "-")
-df_truth = df[truth_mask].copy()
-df_inc = df[~truth_mask].copy()
+### LOGIC & EXAMPLES
+1. DEPARTURE LOGIC:
+   - Notes: 'Billy Williams, 35, healthy stout man, (Richard Browne). Formerly lived with Mr. Moore of Reedy Island, Caroline, from whence he came with the 71st Regiment about 3 years ago.' -> 
+     Ship_Notes: 'Ship Aurora bound for St. John's'
+    
+     First_Name: Billy, Surname: Williams, Ship_Name: Aurora, Arrival_Port: St. John's, 
+     Arrival_Country: Canada, Arrival_Coordinates: 47.5704, -52.7129
+     Extracted_City: -, Extracted_County: -, Extracted_Area: Reedy Island (since it's not 
+     a city or County), Extracted_State: Delaware (inferred based on Reedy Island), Country: United States (inferred based
+     on State and Area name), Departure_Coordinates: 39.7392, -75.5398, Commander: -, Age: 35
 
-indices_to_delete = []
+   - Notes: 'Rose Richard, 20, healthy young woman, (Thomas Richard). Property of Thomas Richard, a refugee from Philadelphia.' -> 
+     Ship_Notes: 'Ship Aurora bound for St. John's'
+    
+     First_Name: Rose, Surname: Richard, Ship_Name: Aurora, Arrival_Port: St. John's, 
+     Arrival_Country: Canada, Arrival_Coordinates: 47.5704, -52.7129
+     Extracted_City: -, Extracted_County: -, Extracted_Area: -, Extracted_State: Pennsylvania, Country: United States (inferred based
+     on State and Area name), Departure_Coordinates: 39.9526, -75.1652, Commander: -, Age: 20
 
-print(f"🔍 Analyzing {len(df_inc)} records with blank 'Book' entries...")
+   - 'John Chapman of Princess Ann County, Virginia' -> Extracted_County: Princess Ann, Extracted_State: Virginia, Country: United States
+   - 'St. Paul's, London' -> Extracted_City: London, Country: United Kingdom
+   - 'Kingston, Jamaica' -> Extracted_City: Kingston, Country: Jamaica
+   - 'Head of Elk' -> Extracted_City: Elkton, Extracted_State: Maryland, Country: United States, Departure_Coordinates: 39.6068, -75.8333
 
-for idx, inc_row in df_inc.iterrows():
-    match_row = find_best_truth_match(inc_row, df_truth)
+2. EXTRACTION RULES:
+   - Extracted_State should have only a correct US state name. If you can't be sure, put '-'
+   - Country should have only a correct country name. If you can't be sure, put '-'
+   - Coordinates should be in format 'latitude, longitude' with only numbers. If you can't find them, put '-'
+   - Age is typically given just after the name in Notes. Extract as a number. If not found, put '-'
+   - Commander name can ONLY come from Ship_Notes and must be a Name string. Don't infer it. If not found, put '-'
+   - Ship_Name comes from Ship_Notes only
+   - Arrival_Port and Arrival_Country come from Ship_Notes only
+   - Use '-' for any field you cannot confidently extract
 
-    if match_row is not None:
-        # Step 1: Combine names for processing
-        inc_full_name = get_combined_name(inc_row['First_Name'], inc_row['Surname'])
-        truth_full_name = get_combined_name(match_row['First_Name'], match_row['Surname'])
+TEXT TO PROCESS:
+{context}
 
-        # Step 2: Compare Names (Fuzzy check for typos like William Holchapan)
-        name_score = fuzz.token_sort_ratio(inc_full_name, truth_full_name)
+RESPONSE FORMAT (EXACTLY 14 VALUES SEPARATED BY '|'):
+"""
+    
+    try:
+        response = client.generate(
+            model='qwen2.5:7b',
+            prompt=prompt,
+            options={
+                "num_ctx": 2048,  # Increased for more context
+                "temperature": 0,
+                "num_predict": 200,  # Slightly increased for detailed responses
+                "stop": ["TEXT TO", "INSTRUCTION", "FIELD ORDER", "LOGIC", "RULES", "\n\n"]
+            }
+        )
+        
+        raw_output = response['response'].strip()
+        
+        # Post-Processing: Remove any extra text before the actual values
+        # Extract only the pipe-separated values
+        lines = raw_output.split('\n')
+        
+        # Find the line with actual data (contains pipes and values)
+        extracted_line = None
+        for line in lines:
+            if '|' in line:
+                extracted_line = line.strip()
+                break
+        
+        if not extracted_line:
+            extracted_line = raw_output
+        
+        # Remove any remaining labels or extra text
+        clean_output = re.sub(r'(?i)[a-z_\s]+:\s*', '', extracted_line)
+        clean_output = clean_output.strip()
+        
+        # Split by pipe and clean each part
+        parts = [p.strip() for p in clean_output.split('|')]
+        
+        # Ensure exactly 14 columns
+        while len(parts) < 14:
+            parts.append("-")
+        
+        parts = parts[:14]
+        
+        return parts
+        
+    except Exception as e:
+        print(f"Error processing row: {e}")
+        return ["-"] * 14
 
-        if name_score > 90:
-            # SCENARIO: Duplicate found -> Delete
-            indices_to_delete.append(idx)
-        else:
-            # SCENARIO: Ship/Commander match but Name is different -> Update & Salvage
-            # Logic: Populate Book, Ship_Notes, and Commander from Truth
-            df.at[idx, 'Book'] = match_row['Book']
-            df.at[idx, 'Ship_Notes'] = match_row['Ship_Notes']
-            df.at[idx, 'Commander'] = match_row['Commander']
-            # Note: Rest of columns like First_Name/Surname remain unchanged
 
-# --- 4. Final Save ---
-df_final = df.drop(indices_to_delete)
-df_final.to_excel('Consolidated_Directory_v4.xlsx', index=False)
+# --- 2. Main Execution ---
+def main():
+    input_file = 'Consolidated_Directory_v12_subset.xlsx' 
+    output_file = 'Consolidated_Directory_v12_ollama.xlsx'
+    
+    df = pd.read_excel(input_file)
+    print(f"Validating {len(df)} records. Applying Optimized Extraction Protocol...")
+    print(f"Total records to process: {len(df)}\n")
+    
+    start_time = time.time()
+    
+    # Process with 2 workers for i5 stability
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(tqdm(
+            executor.map(ollama_validate_and_fix, [row for _, row in df.iterrows()]), 
+            total=len(df), 
+            desc="Auditing Records",
+            unit="record"
+        ))
+    
+    # Define validated columns in the correct order (must match prompt field order)
+    validated_cols = [
+        'First_Name', 
+        'Surname', 
+        'Ship_Name', 
+        'Arrival_Port', 
+        'Arrival_Country', 
+        'Arrival_Coordinates',
+        'Extracted_City', 
+        'Extracted_County', 
+        'Extracted_State', 
+        'Extracted_Area', 
+        'Country', 
+        'Departure_Coordinates',
+        'Commander', 
+        'Age'
+    ]
+    
+    # Assign results directly to DataFrame columns
+    print("\nAssigning validated data to DataFrame...")
+    for i, col in enumerate(validated_cols):
+        df[col] = [result[i] if i < len(result) else "-" for result in results]
+    
+    # Verify the data was assigned correctly
+    print("\n" + "="*80)
+    print("VALIDATION PREVIEW - First 5 rows of extracted data:")
+    print("="*80)
+    print(df[validated_cols].head().to_string())
+    print("="*80 + "\n")
+    
+    # Calculate Birthdate in Python (1783 - Age)
+    def calc_birth(age):
+        try:
+            match = re.search(r'\d+', str(age))
+            if match:
+                return 1783 - int(match.group())
+            return "-"
+        except:
+            return "-"
+    
+    df['Birthdate'] = df['Age'].apply(calc_birth)
+    
+    # Write to Excel
+    df.to_excel(output_file, index=False)
+    
+    elapsed_time = round(time.time() - start_time, 2)
+    print(f"✨ SUCCESS")
+    print(f"Total Time: {elapsed_time}s")
+    print(f"Records Processed: {len(df)}")
+    print(f"Output File: {output_file}")
+    print(f"Processing Rate: {round(len(df)/elapsed_time, 2)} records/second")
 
-print(f"✨ Process Complete.")
-print(f"   - Records deleted (duplicates): {len(indices_to_delete)}")
-print(f"   - Records salvaged (missing info populated): {len(df_inc) - len(indices_to_delete)}")
+if __name__ == "__main__":
+    main()
