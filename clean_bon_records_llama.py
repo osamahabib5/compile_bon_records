@@ -2,23 +2,27 @@ import pandas as pd
 import re
 import time
 import os
+import json
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from dotenv import load_dotenv
 from groq import Groq
 
-# --- 1. CONFIGURATION & CONSTANTS ---
+# --- 1. CONFIGURATION ---
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 MODEL_NAME = "llama-3.1-8b-instant"
-MAX_WORKERS = 1  
-REQUEST_DELAY_SECONDS = 2.0
+
+# RATE LIMIT TUNING (For 6,000 TPM limit)
+MAX_WORKERS = 1           
+REQUEST_DELAY = 18.0      
 BIRTH_BASE_YEAR = 1783
 INPUT_FILE = 'Consolidated_Directory_v12_subset.xlsx' 
 OUTPUT_FILE = 'Validated_Records_Cleaned.xlsx'
+USAGE_LOG_FILE = 'groq_usage_log.json'
 
-# The 33 columns schema
 VALIDATED_COLUMNS = [
     "ID", "Book", "First_Name", "Surname", "Ship_Name", "Notes", "Ship_Notes",
     "Birthdate", "Gender", "Race", "Ethnicity", "Origin", "Extracted_City", 
@@ -29,154 +33,138 @@ VALIDATED_COLUMNS = [
     "Ref_Page", "Commander", "Enslaver", "Primary_Source_1", "Primary_Source_2"
 ]
 
-# --- 2. HELPER FUNCTIONS ---
+# --- 2. USAGE TRACKING ---
+
+class UsageTracker:
+    def __init__(self, log_file):
+        self.log_file = log_file
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w') as f:
+                json.dump([], f)
+
+    def log_request(self, tokens_used):
+        now = datetime.now().isoformat()
+        try:
+            with open(self.log_file, 'r+') as f:
+                data = json.load(f)
+                data.append({"timestamp": now, "tokens": tokens_used})
+                f.seek(0)
+                json.dump(data, f)
+        except: pass
+
+    def get_24h_stats(self):
+        cutoff = datetime.now() - timedelta(hours=24)
+        total_tokens = 0
+        total_requests = 0
+        try:
+            with open(self.log_file, 'r') as f:
+                data = json.load(f)
+                valid_data = [e for e in data if datetime.fromisoformat(e['timestamp']) > cutoff]
+                total_tokens = sum(e['tokens'] for e in valid_data)
+                total_requests = len(valid_data)
+            with open(self.log_file, 'w') as f:
+                json.dump(valid_data, f)
+            return total_requests, total_tokens
+        except: return 0, 0
+
+tracker = UsageTracker(USAGE_LOG_FILE)
+
+# --- 3. REFINED PROMPT WITH EXAMPLES ---
 
 def build_prompt(row: pd.Series) -> str:
-    """Build refined prompt with strict 33-column mapping and validation logic."""
     current = row.to_dict()
     current_values = "\n".join([f"{k}: {current.get(k, '-')}" for k in VALIDATED_COLUMNS])
-
-    context = (
-        f"Notes: {current.get('Notes', '-')}\n"
-        f"Ship_Notes: {current.get('Ship_Notes', '-')}"
-    )
-
+    
     return f"""### ROLE
-You are a precision-oriented historical data auditor for the Book of Negroes (1783).
+Precision Historical Data Auditor (Book of Negroes, 1783).
 
 ### OBJECTIVE
-Clean and enrich historical records. You must return EXACTLY 33 pipe-separated values (|). 
+Extract data into EXACTLY 33 pipe-separated values (|). Follow these logic patterns exactly:
 
-### EXTRACTION & VALIDATION RULES:
-1. **STRICT PRESERVATION (DO NOT MODIFY)**: 
-   For [ID, Book, Notes, Ship_Name, Ship_Notes, Ref_Page, Primary_Source_1, Primary_Source_2], use the EXACT value provided in "CURRENT DATA". Do not fix typos or update these from the text.
-
-2. **IDENTITY LOGIC**:
-   - "Mulatto" -> Race: Mulatto | Ethnicity: Mixed Race.
-   - "Quadroon" -> Race: Quadroon | Ethnicity: Mixed Race.
-   - Mixed Heritage (e.g., "Indian & Span", "Mother an Indian") -> Origin: [Heritages] | Ethnicity: Mixed Race.
-   - Example: Andrew Hilton (mulatto, mother Indian) -> Race: Mulatto | Ethnicity: Mixed Race | Origin: Indian.
-
-3. **AGE & TEMPORAL DATA**:
-   - **Birthdate**: Extract age from Notes. Return as: ({BIRTH_BASE_YEAR} - Age). Result must be a 4-digit year.
-   - **Departure_Date**: Must be '1783' for all records. No non-numeric values allowed (like 'New York')
-   - **Departure_Coordinates/Arrival_Coordinates**: Return 'latitude, longitude' (numbers and decimals only). Else '-'. No text allowed.
-
-4. **GEOGRAPHIC CONSTRAINTS**:
-   - **Extracted_State**: Valid US State only (e.g., Virginia). Else '-'. No numeric values. Example: "From Virginia" -> Extracted_State: Virginia.
-   - **Extracted_City**: City/Town names only (e.g., Philadelpha). No Counties/States/Country.No numeric values.
-        - *Example 1*: "St. Paul's, London" -> Extracted_City: London | Country: United Kingdom.
-        - *Example 2*: "Born free at Kingston, Jamaica" -> Extracted_City: Kingston | Country: Jamaica.
-   - **Extracted_County**: County names only (e.g., Chesterfield). No Cities/States/Country allowed (like 'Virginia', 'United States','New York'). No numeric values.
-   - **Extracted_Area**: US Islands or specific areas (e.g., Reedy Island). No Cities/States/Country/Counties.No numeric values.
-   - **Country**: 
-        - Default to 'United States' if a US state/city is identified. No numeric values allowed.
-        - Set to 'United Kingdom' for London/English parishes.
-        - Set to 'Jamaica' for Kingston/Jamaican locations.
-   - **Arrival_Port_Country**: Default to 'Canada' if Arrival_Port is in Nova Scotia, St. John's, or similar areas. No numeric or non-country values allowed
-   - **Arrival_Port**: No numeric values allowed. Extract from Ship_Notes only. like St. John's, Port Roseway, etc.
-   - **Commander/Enslaver**: Valid personal names only. No locations, or other text or numeric values.
-
-5. **SOURCE ATTRIBUTION**:
-   - **Ship Data**: Commander, Arrival_Port, and Arrival_Port_Country must come ONLY from Ship_Notes.
-
-6. **STRICT LIMITATION**: 
-   Do not guess. If information is not explicitly in the Text Source, use '-'.
-
-### EXAMPLE DATA:
+### 📖 FEW-SHOT EXAMPLES:
+Example 1:
 Notes: Billy Williams, 35, healthy stout man, (Richard Browne). Formerly lived with Mr. Moore of Reedy Island, Caroline...
 Ship_Notes: Ship Aurora bound for St. John's
-Output: [ID] | [Book] | Billy | Williams | [Ship_Name] | [Notes] | [Ship_Notes] | 1748 | Male | Black | African American | - | - | - | Delaware | Reedy Island, Caroline | United States | 40.7128, -74.0060 | - | New York | 1783 | St. John's | Canada | 45.2733, -66.0633 | - | - | - | - | [Ref_Page] | - | Richard Browne | [Primary_Source_1] | [Primary_Source_2]
+Output: [ID] | [Book] | Billy | Williams | [Ship_Name] | [Notes] | [Ship_Notes] | 1748 | Male | Black | African American | - | - | Caroline | Delaware | Reedy Island | United States | 40.7128, -74.0060 | - | New York | 1783 | St. John's | Canada | 45.2733, -66.0633 | - | - | - | - | [Ref_Page] | - | Richard Browne | [Primary_Source_1] | [Primary_Source_2]
+
+Example 2:
+Notes: Barbarry Allen, 22, healthy stout wench, (Humphry Winters). Property of Humphrey Winters of New York from Virginia.
+Ship_Notes: Ship Aurora bound for St. John's
+Output: [ID] | [Book] | Barbarry | Allen | [Ship_Name] | [Notes] | [Ship_Notes] | 1761 | Female | Black | African American | - | - | - | Virginia | - | United States | 40.7128, -74.0060 | - | New York | 1783 | St. John's | Canada | 45.2733, -66.0633 | - | - | - | - | [Ref_Page] | - | Humphry Winters | [Primary_Source_1] | [Primary_Source_2]
+
+### 🛑 FINAL AUDIT CHECKLIST:
+1. Birthdate: Calculate as (1783 - Age). 
+2. Extracted_State: US States only (e.g., Virginia). 
+3. Extracted_County: NEVER put states here. If "Caroline, Virginia", County is Caroline, State is Virginia.
+4. Arrival_Port_Country: Text only (Canada). NEVER put coordinates here.
+5. Arrival_Coordinates: Numeric only. NEVER put text here.
+6. Preservation: Copy [ID, Book, Notes, Ship_Name, Ship_Notes, Ref_Page] exactly.
 
 ---
-
-### CURRENT DATA (FOR PRESERVATION):
+### CURRENT DATA:
 {current_values}
 
-### TEXT SOURCE (FOR EXTRACTION):
-{context}
+### TEXT SOURCE:
+Notes: {current.get('Notes', '-')}
+Ship_Notes: {current.get('Ship_Notes', '-')}
 
-### OUTPUT FORMAT (33 VALUES):
-ID | Book | First_Name | Surname | Ship_Name | Notes | Ship_Notes | Birthdate | Gender | Race | Ethnicity | Origin | Extracted_City | Extracted_County | Extracted_State | Extracted_Area | Country | Departure_Coordinates | Origination_Port | Departure_Port | Departure_Date | Arrival_Port | Arrival_Port_Country | Arrival_Coordinates | Father_FirstName | Father_Surname | Mother_FirstName | Mother_Surname | Ref_Page | Commander | Enslaver | Primary_Source_1 | Primary_Source_2
+RESPOND WITH PIPE-SEPARATED VALUES ONLY:"""
 
-RESPOND WITH PIPE-SEPARATED VALUES ONLY:
-"""
+# --- 4. PARSING & UTILITIES ---
 
 def parse_pipe_output(raw_output: str, expected_parts: int = 33) -> list[str]:
-    """Parse model output into a fixed-size list of 33 parts."""
-    if not raw_output:
-        return ["-"] * expected_parts
+    lines = [l.strip() for l in raw_output.splitlines() if l.count("|") >= 10]
+    if not lines: return ["-"] * expected_parts
+    data_line = max(lines, key=lambda l: l.count("|"))
+    parts = [p.strip() if p.strip() else "-" for p in data_line.split("|")]
+    return (parts + ["-"] * expected_parts)[:expected_parts]
 
-    lines = raw_output.splitlines()
-    # Find line with most pipes to avoid preamble
-    extracted_line = max(lines, key=lambda l: l.count("|")).strip()
-    extracted_line = re.sub(r"^\s*[A-Za-z_ ]+:\s*", "", extracted_line).strip()
-    
-    parts = [p.strip() if p.strip() else "-" for p in extracted_line.split("|")]
-
-    while len(parts) < expected_parts:
-        parts.append("-")
-    return parts[:expected_parts]
-
-def calculate_birth_year(age_value: str, base_year: int = BIRTH_BASE_YEAR):
-    """Secondary check to ensure birth year is formatted correctly."""
+def calculate_birth_year(age_val):
     try:
-        if re.fullmatch(r"\d{4}", str(age_value)):
-            return age_value
-        match = re.search(r"\d+", str(age_value))
-        if not match: return "-"
-        return base_year - int(match.group())
-    except:
-        return "-"
+        if re.fullmatch(r"\d{4}", str(age_val)): return age_val
+        match = re.search(r"\d+", str(age_val))
+        return BIRTH_BASE_YEAR - int(match.group()) if match else "-"
+    except: return "-"
 
-# --- 3. CORE PROCESSING ---
+# --- 5. EXECUTION ---
 
-def validate_and_fix_row(row: pd.Series) -> list[str]:
-    """Execute API call for a single row."""
+def process_row(row: pd.Series) -> list[str]:
     prompt = build_prompt(row)
     try:
-        time.sleep(REQUEST_DELAY_SECONDS)
+        time.sleep(REQUEST_DELAY) 
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_completion_tokens=900,
+            temperature=0, 
+            max_completion_tokens=400, 
+            stream=False
         )
-        raw_output = completion.choices[0].message.content.strip()
-        return parse_pipe_output(raw_output, expected_parts=len(VALIDATED_COLUMNS))
-    except Exception as exc:
-        print(f"Error processing row {row.get('ID', 'unknown')}: {exc}")
+        
+        tracker.log_request(completion.usage.total_tokens)
+        req_24, tok_24 = tracker.get_24h_stats()
+        print(f"\r[24h Stats] Requests: {req_24} | Tokens: {tok_24:,}", end="")
+        
+        return parse_pipe_output(completion.choices[0].message.content)
+    except Exception as e:
+        if "429" in str(e): time.sleep(30)
         return ["-"] * len(VALIDATED_COLUMNS)
 
 def main():
-    if not os.path.exists(INPUT_FILE):
-        print(f"Error: {INPUT_FILE} not found.")
-        return
-
+    if not os.path.exists(INPUT_FILE): return
     df = pd.read_excel(INPUT_FILE)
-    print(f"Auditing {len(df)} records with strict 33-column schema...")
-
-    start_time = time.time()
+    
+    req_24, tok_24 = tracker.get_24h_stats()
+    print(f"Starting audit. Current 24h usage: {req_24} reqs, {tok_24:,} tokens.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        results = list(tqdm(
-            executor.map(validate_and_fix_row, [row for _, row in df.iterrows()]),
-            total=len(df),
-            desc="Auditing"
-        ))
+        results = list(tqdm(executor.map(process_row, [row for _, row in df.iterrows()]), total=len(df)))
 
-    # Apply results back to the DataFrame
-    for index, col_name in enumerate(VALIDATED_COLUMNS):
-        df[col_name] = [r[index] if index < len(r) else "-" for r in results]
+    for i, col in enumerate(VALIDATED_COLUMNS):
+        df[col] = [r[i] if i < len(r) else "-" for r in results]
 
-    print("Finalizing Birth Year validation...")
     df["Birthdate"] = df["Birthdate"].apply(calculate_birth_year)
-
     df.to_excel(OUTPUT_FILE, index=False)
-    
-    elapsed = round(time.time() - start_time, 2)
-    print(f"\n✨ SUCCESS. Results saved to {OUTPUT_FILE}")
-    print(f"Total time: {elapsed}s | Average: {elapsed/len(df):.2f}s per record")
+    print(f"\nProcessing Complete. Saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()

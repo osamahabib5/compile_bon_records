@@ -7,141 +7,159 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 from groq import Groq
 
-# --- 1. Initialization ---
+# --- 1. CONFIGURATION & CONSTANTS ---
 load_dotenv()
-
-# Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-def ollama_validate_and_fix(row):
-    """
-    Extracts 32 columns using Qwen 3-32B via Groq API.
-    """
-    current_data = row.to_dict()
-    context = (
-        f"Notes: {current_data.get('Notes', '-')}\n"
-        f"Ship_Notes: {current_data.get('Ship_Notes', '-')}"
-    )
-    
-    # REFINED PROMPT: 32 Columns with Specific Identity & Batch Logic
-    # REFINED PROMPT: 32 Columns with Specific Identity Logic
-    prompt = f"""### INSTRUCTION
-Extract historical data from the Notes and Ship_Notes columns. Return ONLY values separated by '|'. 
-Use '-' for missing info. Your output must contain exactly 32 values.
+# Configuration optimized for Qwen 3-32B Limits
+MODEL_NAME = "qwen/qwen3-32b"
+MAX_WORKERS = 2           # Keeping concurrency low to stay under 6k tokens/min
+REQUEST_DELAY = 1.1       # Ensures we stay under 60 requests per minute
+BIRTH_BASE_YEAR = 1783
+INPUT_FILE = 'Consolidated_Directory_v12_subset.xlsx' 
+OUTPUT_FILE = 'Validated_Records_Cleaned.xlsx'
 
-### BATCH PROCESSING RULE
-Multiple records often share the same 'Ship_Notes'. The following fields MUST remain consistent for shared ships:
-- Ship_Name, Commander, Arrival_Port, Arrival_Port_Country, Arrival_Coordinates.
+VALIDATED_COLUMNS = [
+    "ID", "Book", "First_Name", "Surname", "Ship_Name", "Notes", "Ship_Notes",
+    "Birthdate", "Gender", "Race", "Ethnicity", "Origin", "Extracted_City", 
+    "Extracted_County", "Extracted_State", "Extracted_Area", "Country", 
+    "Departure_Coordinates", "Origination_Port", "Departure_Port", 
+    "Departure_Date", "Arrival_Port", "Arrival_Port_Country", "Arrival_Coordinates", 
+    "Father_FirstName", "Father_Surname", "Mother_FirstName", "Mother_Surname", 
+    "Ref_Page", "Commander", "Enslaver", "Primary_Source_1", "Primary_Source_2"
+]
 
-### FIELD ORDER (32 COLUMNS)
-ID | Book | First_Name | Surname | Ship_Name | Notes | Ship_Notes | Birthdate | Gender | Race | Ethnicity | Origin | Extracted_City | Extracted_County | Extracted_State | Extracted_Area | Country | Departure_Coordinates | Departure_Port | Departure_Date | Arrival_Port | Arrival_Port_Country | Arrival_Coordinates | Father_FirstName | Father_Surname | Mother_FirstName | Mother_Surname | Ref_Page | Commander | Enslaver | Primary_Source_1 | Primary_Source_2
+# --- 2. PROMPT BUILDING ---
 
-### IDENTITY & EXTRACTION RULES
-1. **Race, Ethnicity, & Origin Logic**:
-   - If 'Mulatto' is mentioned: Race -> Mulatto, Ethnicity -> Mixed Race.
-   - If 'Quadroon' is mentioned: Race -> Quadroon, Ethnicity -> Mixed Race.
-   - If heritage is mixed (e.g., 'Indian & Span' or 'mother an Indian'): Ethnicity -> Mixed Race, Origin -> [Specific Heritage].
-2. **Birthdate**: Extract ONLY the age as a number.
-3. **Gender**: Use 'Child Male/Female' if age < 18, otherwise 'Male/Female'.
-4. **Geography**: 'Extracted_State' must be a valid US State; 'Country' must be a valid Country.
-5. **Don't change**: Return the existing DataFrame value exactly as-is; do not modify using Notes or Ship_Notes.
+def build_prompt(row: pd.Series) -> str:
+    """Refined prompt with strict categorical exclusion and Qwen-specific formatting."""
+    current = row.to_dict()
+    current_values = "\n".join([f"{k}: {current.get(k, '-')}" for k in VALIDATED_COLUMNS])
+    context = f"Notes: {current.get('Notes', '-')}\nShip_Notes: {current.get('Ship_Notes', '-')}"
 
-### EXAMPLES
-- Notes: 'Charles Allen, 25, stout, M, between an Indian & Span., (Pioneer, KAD). Free by General Birch's certificate says he lived with Matthew Hobbs of Sussex County, Maryland, until 25.'
-  Ship_Notes: 'Ship Lady's Adventure bound for St. John's Capt. Robt. Gibson' 
-  Output: (Don't change) | (Don't change) | Charles | Allen | (Don't change) | (Don't change) | (Don't change) | 25 | Male | Mulatto | Mixed Race | Indian / Spanish | - | Sussex | Maryland | - | United States | [Coords] | [Port] | 1783 | [Port] | [Country] | [Coords] | - | - | - | - | - | [Commander] | Pioneer, KAD | [Source1] | [Source2]
+    return f"""### ROLE
+You are a precision-oriented historical data auditor for the Book of Negroes (1783).
 
-- Notes: 'Sarah Johnson, 22, squat wench, quadroon, (Donald Ross). Formerly slave to Burgess Smith, Lancaster County; left him with the above Thomas Johnson her husband. GBC'
-  Ship_Notes: 'Tree Briton bound for Port Roseway Jacob Hays, Master' 
-  Output: (Don't change) | (Don't change) | Sarah | Johnson | (Don't change) | (Don't change) | (Don't change) | 22 | Female | Quadroon | Mixed Race | - | - | Lancaster | Pennsylvania | - | United States | [Coords] | [Port] | 1783 | [Port] | [Country] | [Coords] | - | - | - | - | - | [Commander] | Donald Ross |
+### OBJECTIVE
+Clean and enrich historical records. You must return EXACTLY 33 pipe-separated values (|). 
 
-TEXT TO PROCESS:
+### EXTRACTION & VALIDATION RULES:
+1. **STRICT PRESERVATION (DO NOT MODIFY)**: 
+   For [ID, Book, Notes, Ship_Name, Ship_Notes, Ref_Page, Primary_Source_1, Primary_Source_2], use the EXACT value provided in "CURRENT DATA". Do not fix typos or update these from the text.
+
+2. **IDENTITY LOGIC**:
+   - "Mulatto" -> Race: Mulatto | Ethnicity: Mixed Race.
+   - "Quadroon" -> Race: Quadroon | Ethnicity: Mixed Race.
+   - Mixed Heritage (e.g., "Indian & Span", "Mother an Indian") -> Origin: [Heritages] | Ethnicity: Mixed Race.
+   - Example: Andrew Hilton (mulatto, mother Indian) -> Race: Mulatto | Ethnicity: Mixed Race | Origin: Indian.
+
+3. **AGE & TEMPORAL DATA**:
+   - **Birthdate**: Extract age from Notes. Return as: ({BIRTH_BASE_YEAR} - Age). Result must be a 4-digit year.
+   - **Departure_Date**: Must be '1783' for all records. No non-numeric values allowed (like 'New York')
+   - **Departure_Coordinates/Arrival_Coordinates**: Return 'latitude, longitude' (numbers and decimals only). Else '-'. No text allowed.
+
+4. **GEOGRAPHIC CONSTRAINTS**:
+   - **Extracted_State**: Valid US State only (e.g., Virginia). Else '-'. No numeric values. Example: "From Virginia" -> Extracted_State: Virginia.
+   - **Extracted_City**: City/Town names only (e.g., Philadelpha). No Counties/States/Country.No numeric values.
+        - *Example 1*: "St. Paul's, London" -> Extracted_City: London 
+        - *Example 2*: "Born free at Kingston, Jamaica" -> Extracted_City: Kingston
+   - **Extracted_County**: County names only (e.g., Chesterfield, Princess Ann). No Cities/States/Country and numeric values.
+   - **Extracted_Area**: US Islands or specific areas (e.g., Reedy Island). No Cities/States/Country/Counties.No numeric values.
+   - **Country**: 
+        - Default to 'United States' if a US state/city is identified. No numeric values allowed.
+        - Set to 'United Kingdom' for London/English parishes.
+        - Set to 'Jamaica' for Kingston/Jamaican locations.
+   - **Arrival_Port_Country**: Default to 'Canada' if Arrival_Port is in Nova Scotia, St. John's, or similar areas. No numeric or non-country values allowed
+   - **Arrival_Port**: No numeric values allowed. Extract from Ship_Notes only. like St. John's, Port Roseway, etc.
+   - **Commander/Enslaver**: Valid personal names only. No locations, or other text or numeric values.
+
+5. **SOURCE ATTRIBUTION**:
+   - **Ship Data**: Commander, Arrival_Port, and Arrival_Port_Country must come ONLY from Ship_Notes.
+
+6. **STRICT LIMITATION**: 
+   Do not guess. If information is not explicitly in the Text Source, use '-'.
+
+### EXAMPLE DATA:
+Notes: Billy Williams, 35, healthy stout man, (Richard Browne). Formerly lived with Mr. Moore of Reedy Island, Caroline...
+Ship_Notes: Ship Aurora bound for St. John's
+Output: [ID] | [Book] | Billy | Williams | [Ship_Name] | [Notes] | [Ship_Notes] | 1748 | Male | Black | African American | - | - | - | Delaware | Reedy Island | United States | 40.7128, -74.0060 | - | New York | 1783 | St. John's | Canada | 45.2733, -66.0633 | - | - | - | - | [Ref_Page] | - | Richard Browne | [Primary_Source_1] | [Primary_Source_2]
+
+Notes: Barbarry Allen, 22, healthy stout wench, (Humphry Winters). Property of Humphrey Winters of New York from Virginia.
+Ship_Notes: Ship Aurora bound for St. John's
+Output: [ID] | [Book] | Barbarry | Allen | [Ship_Name] | [Notes] | [Ship_Notes] | 1761 | Female | Black | African American | - | - | - | Virginia | - | United States | 40.7128, -74.0060 | - | New York | 1783 | St. John's | Canada | 45.2733, -66.0633 | - | - | - | - | [Ref_Page] | - | Humphry Winters | [Primary_Source_1] | [Primary_Source_2]
+
+---
+
+### CURRENT DATA (FOR PRESERVATION):
+{current_values}
+
+### TEXT SOURCE (FOR EXTRACTION):
 {context}
 
-RESPONSE FORMAT (EXACTLY 32 VALUES SEPARATED BY '|'):
+### OUTPUT FORMAT (33 VALUES):
+ID | Book | First_Name | Surname | Ship_Name | Notes | Ship_Notes | Birthdate | Gender | Race | Ethnicity | Origin | Extracted_City | Extracted_County | Extracted_State | Extracted_Area | Country | Departure_Coordinates | Origination_Port | Departure_Port | Departure_Date | Arrival_Port | Arrival_Port_Country | Arrival_Coordinates | Father_FirstName | Father_Surname | Mother_FirstName | Mother_Surname | Ref_Page | Commander | Enslaver | Primary_Source_1 | Primary_Source_2
+
+RESPOND WITH PIPE-SEPARATED VALUES ONLY:
 """
-    
+
+# --- 3. PARSING & UTILITIES ---
+
+def parse_pipe_output(raw_output: str, expected_parts: int = 33) -> list[str]:
+    if not raw_output:
+        return ["-"] * expected_parts
+    lines = raw_output.strip().split('\n')
+    # Pick the line with the most pipes to bypass any AI chatter
+    extracted_line = max(lines, key=lambda l: l.count("|"))
+    parts = [p.strip() if p.strip() else "-" for p in extracted_line.split("|")]
+    while len(parts) < expected_parts:
+        parts.append("-")
+    return parts[:expected_parts]
+
+def calculate_birth_year(age_val):
     try:
-        # Rate limit compliance: 60 RPM = 1.1s delay between requests
-        time.sleep(1.1) 
-        
+        if re.fullmatch(r"\d{4}", str(age_val)): return age_val
+        match = re.search(r"\d+", str(age_val))
+        return BIRTH_BASE_YEAR - int(match.group()) if match else "-"
+    except: return "-"
+
+# --- 4. EXECUTION ---
+
+def process_row(row: pd.Series) -> list[str]:
+    prompt = build_prompt(row)
+    try:
+        time.sleep(REQUEST_DELAY) # Rate limit pacing
         completion = client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0, # Keeping it 0 for extraction accuracy despite sample 0.6
-            max_completion_tokens=4096,
+            temperature=0, 
+            max_completion_tokens=400, # Lower tokens = safer for your 6k/min limit
             top_p=0.95,
-            stream=False, # Set to False for cleaner parsing in batch scripts
-            extra_headers={"X-Groq-Prompt-Caching": "on"}
+            stream=False
         )
-        
-        raw_output = completion.choices[0].message.content.strip()
-        extracted_line = next((line.strip() for line in raw_output.split('\n') if '|' in line), raw_output)
-        clean_output = re.sub(r'(?i)[a-z_\s]+:\s*', '', extracted_line).strip()
-        parts = [p.strip() for p in clean_output.split('|')]
-        
-        while len(parts) < 32:
-            parts.append("-")
-        return parts[:32]
-        
+        return parse_pipe_output(completion.choices[0].message.content)
     except Exception as e:
-        print(f"Error processing row: {e}")
-        return ["-"] * 32
+        if "rate_limit" in str(e).lower():
+            time.sleep(10) # Back off if limited
+        return ["-"] * len(VALIDATED_COLUMNS)
 
-# --- 2. Main Execution ---
 def main():
-    input_file = 'Consolidated_Directory_v12_subset.xlsx' 
-    output_file = 'Validated_Records_Fixed_Qwen.xlsx'
-    
-    df = pd.read_excel(input_file)
-    
-    # Check against Daily Limit
-    if len(df) > 1000:
-        print(f"⚠️ Warning: Dataset size ({len(df)}) exceeds Qwen daily limit (1,000 requests/day).")
-        print("Processing the first 1,000 records only.")
-        df = df.head(1000)
+    if not os.path.exists(INPUT_FILE):
+        print(f"File {INPUT_FILE} not found.")
+        return
 
-    print(f"Validating {len(df)} records using Qwen 3-32B...")
-    start_time = time.time()
-    
-    # Use 1 worker to strictly respect the 60 RPM / 6K TPM limits
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        results = list(tqdm(
-            executor.map(ollama_validate_and_fix, [row for _, row in df.iterrows()]), 
-            total=len(df), 
-            desc="Auditing Records"
-        ))
-    
-    validated_cols = [
-        'ID', 'Book', 'First_Name', 'Surname', 'Ship_Name', 'Notes', 'Ship_Notes',
-        'Birthdate', 'Gender', 'Race', 'Ethnicity', 'Origin', 'Extracted_City', 
-        'Extracted_County', 'Extracted_State', 'Extracted_Area', 'Country', 
-        'Departure_Coordinates', 'Departure_Port', 'Departure_Date', 'Arrival_Port', 
-        'Arrival_Port_Country', 'Arrival_Coordinates', 'Father_FirstName', 
-        'Father_Surname', 'Mother_FirstName', 'Mother_Surname', 'Ref_Page', 
-        'Commander', 'Enslaver', 'Primary_Source_1', 'Primary_Source_2'
-    ]
-    
-    for i, col in enumerate(validated_cols):
-        df[col] = [result[i] if i < len(result) else "-" for result in results]
-    
-    def calc_birth(extracted_age):
-        try:
-            match = re.search(r'\d+', str(extracted_age))
-            if match:
-                return 1783 - int(match.group())
-            return "-"
-        except:
-            return "-"
-    
-    print("Calculating birth years...")
-    df['Birthdate'] = df['Birthdate'].apply(calc_birth)
-    
-    df.to_excel(output_file, index=False)
-    
-    elapsed_time = round(time.time() - start_time, 2)
-    print(f"✨ SUCCESS. File saved: {output_file}")
-    print(f"Qwen Daily Quota Used: {len(df)}/1,000")
+    df = pd.read_excel(INPUT_FILE)
+    print(f"Auditing {len(df)} records using {MODEL_NAME}...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = list(tqdm(executor.map(process_row, [row for _, row in df.iterrows()]), total=len(df)))
+
+    # Map results back to DataFrame
+    for i, col in enumerate(VALIDATED_COLUMNS):
+        df[col] = [r[i] if i < len(r) else "-" for r in results]
+
+    df["Birthdate"] = df["Birthdate"].apply(calculate_birth_year)
+    df.to_excel(OUTPUT_FILE, index=False)
+    print(f"Process complete. Output saved to: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()

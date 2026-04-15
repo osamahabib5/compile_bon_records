@@ -20,3 +20,5 @@ df['latitude'] = df['location'].apply(lambda loc: loc.latitude if loc else None)
 df['longitude'] = df['location'].apply(lambda loc: loc.longitude if loc else None)
 
 print(df[['Place', 'country', 'latitude', 'longitude']])
+
+
