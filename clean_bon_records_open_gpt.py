@@ -22,7 +22,7 @@ except ImportError:
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-MODEL_NAME = "qwen/qwen3-32b"
+MODEL_NAME = "openai/gpt-oss-120b"
 EXPECTED_OUTPUT_COLUMNS = 33
 BIRTH_BASE_YEAR = 1783
 SHIP_CONTEXT_FIELDS = ["Ship_Name", "Commander", "Arrival_Port", "Arrival_Port_Country"]
@@ -36,20 +36,21 @@ LLM_TARGET_COLUMNS = [
     "Departure_Port",
     "Arrival_Port",
     "Arrival_Port_Country",
-    "Commander"
+    "Commander",
+    "Ship_Name"
 ]
 
-# Qwen 3-32B preview limits: 6K TPM / 60 RPM / 500K daily
-TPM_LIMIT = 5800
-RPM_LIMIT = 56
-DAILY_TOKEN_LIMIT = 485000
-DAILY_REQUEST_LIMIT = None
-REQUEST_DELAY = 1.1
+# OpenAI GPT OSS 120B production limits: 8K TPM / 30 RPM / 200K daily
+TPM_LIMIT = 8000
+RPM_LIMIT = 30
+DAILY_TOKEN_LIMIT = 200000
+DAILY_REQUEST_LIMIT = 1000
+REQUEST_DELAY = 2.0
 GEOPY_REQUEST_DELAY = 1.1
 
 INPUT_FILE = "Consolidated_Directory_v12_subset.xlsx"
 OUTPUT_FILE = "Validated_Records_Cleaned.xlsx"
-USAGE_LOG_FILE = "groq_qwen_usage_log.json"
+USAGE_LOG_FILE = "groq_openai_oss_usage_log.json"
 COUNTY_LOOKUP_FILE = "US_Counties_Coordinates.xlsx"
 
 INPUT_COST_1M = 0.29
@@ -95,33 +96,26 @@ COUNTY_HINTS = (" county", " parish")
 SYSTEM_PROMPT = f"""Historical data validator for Book of Negroes records (1783).
 
 Return exactly {EXPECTED_OUTPUT_COLUMNS} pipe-separated values.
-Only verify: Extracted_City, Extracted_County, Extracted_State, Extracted_Area, Country, Origination_Port, Departure_Port, Arrival_Port, Arrival_Port_Country, Commander. Do not edit any other columns.
-Keep all existing non-empty values unless clearly wrong for that column; first move, then delete misplaced values.
-Use Notes only if Extracted_City, Extracted_County, Extracted_State, Extracted_Area, Country, Origination_Port, or Departure_Port is blank or clearly wrong.
-Use Ship_Notes only for Arrival_Port and Arrival_Port_Country.
-Do not generate or edit Departure_Coordinates or Arrival_Coordinates. Python will populate coordinates after extraction is complete.
+Only modify or fill: Extracted_City, Extracted_County, Extracted_State, Extracted_Area, Country, Origination_Port, Departure_Port, Arrival_Port, Arrival_Port_Country, Commander, Ship_Name.
+Do not change Primary_Source_1 or Primary_Source_2.
+Keep existing non-empty values unless they are clearly wrong for that field and derived from the allowed source.
+Only use Notes for: Extracted_City, Extracted_County, Extracted_State, Extracted_Area, Country, Origination_Port, Departure_Port.
+Only use Ship_Notes for: Arrival_Port, Arrival_Port_Country, Ship_Name, Commander.
+Do not use Ship_Notes to fill any extracted city, county, state, area, country, origination port, or departure port values.
+Do not use Notes to fill Arrival_Port, Arrival_Port_Country, Ship_Name, or Commander.
+Do not generate or edit Departure_Coordinates or Arrival_Coordinates.
 Rules:
-- Extracted_City = city only (like Princetown,Philadelphia)
-- Extracted_County = county/region only (like Suffolk, Middlesex)
-- Extracted_State = valid US state only Ilike Virginia)
+- Extracted_City = city only
+- Extracted_County = county or region only
+- Extracted_State = valid US state only
 - Extracted_Area = area only
-- Arrival_Port = city only
+- Arrival_Port = specific port only, not a state or country
 - Country and Arrival_Port_Country = sovereign country only
-- Ports = specific port names only
-- Commander = valid human names only (like John Clark)
-- Extracted_City cannot contain a US state, country, county, or broad area name
-- Extracted_County cannot contain a city, sovereign country, or US state
-- Extracted_State must be one of the US states only; if not a US state, move it elsewhere or replace from Notes
-- Country must be a sovereign country only; never a city, county, area, or US state
-- If a field has a wrong-type value, move it to the correct field when possible
-- If Extracted_City has a state value like South Carolina, move it to Extracted_State and use Notes to recover the true city if available. else leave -
-- If Extracted_State is blank or invalid, use Notes to find a valid US state only
-- If Country is blank or invalid, use Notes to find the sovereign country
-- If Origination_Port or Departure_Port is blank or invalid, use Notes to find a specific port only
-- If Arrival_Port_Country is blank or invalid, use Ship_Notes to find the sovereign country
-- If Arrival_Port is blank or invalid, use Ship_Notes to find a specific city port only (e.g. Halifax, Quebec, London)
-- If Commander is blank or invalid, use Ship_Notes to find a valid human name (like John Adamson). Else put -
-- Move state from city, county from city, city from county, country from state
+- Commander = valid human person name only
+- Treat St. John's and Port Roseway as arrival ports, not commanders
+- If a field is wrong-type, move it to the right field when possible
+- If Commander is blank or invalid, set '-'
+- If a required field cannot be determined from the allowed source, return '-'
 No guessing. No headers. Values only."""
 
 
@@ -137,7 +131,7 @@ def load_spacy_pipeline():
 
 
 NLP = load_spacy_pipeline()
-geolocator = Nominatim(user_agent="bon_qwen_cleaner") if Nominatim is not None else None
+geolocator = Nominatim(user_agent="bon_openai_oss_cleaner") if Nominatim is not None else None
 
 
 # --- 2. USAGE & RATE LIMIT TRACKER ---
@@ -205,7 +199,7 @@ class UsageTracker:
             (self.session_out_tokens / 1_000_000) * OUTPUT_COST_1M
         )
         print("\n" + "=" * 45)
-        print("QWEN CLEANING SUMMARY")
+        print("OpenAI OSS 120B Cleaning Summary")
         print(f"Total Tokens:   {self.session_in_tokens + self.session_out_tokens:,}")
         print(f" - Input:       {self.session_in_tokens:,}")
         print(f" - Output:      {self.session_out_tokens:,}")
@@ -481,6 +475,27 @@ def clean_surname(value):
     return pieces[-1].strip(",. ") if pieces else "-"
 
 
+def is_valid_commander_name(value):
+    value = normalize_output_value(value)
+    if value == "-":
+        return False
+    lower = value.lower()
+    if lower in {key.lower() for key in ARRIVAL_PORT_COUNTRIES}:
+        return False
+    if lower in {state.lower() for state in US_STATES | KNOWN_COUNTRIES}:
+        return False
+    if re.search(r"\bport\b", lower):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z'.-]+(?:\s+[A-Za-z'.-]+)*", value))
+
+
+def validate_commander(record):
+    commander = normalize_output_value(record.get("Commander", "-"))
+    if not is_valid_commander_name(commander):
+        record["Commander"] = "-"
+    return record
+
+
 def infer_birth_year(notes, current_birthdate):
     current_birthdate = normalize_value(current_birthdate)
     if is_year_string(current_birthdate):
@@ -739,6 +754,13 @@ def post_process_record(output_row, source_row):
     record = coerce_record_types(record, source_row)
     record = apply_geography_repairs(record)
     record = apply_voyage_repairs(record)
+    record = validate_commander(record)
+
+    # If the model changed any non-target column values, restore the original Excel values.
+    for col in VALIDATED_COLUMNS:
+        if col not in LLM_TARGET_COLUMNS and record[col] != source_record[col]:
+            record[col] = source_record[col]
+
     record = apply_source_consistency(record)
     return [record[col] for col in VALIDATED_COLUMNS]
 
@@ -885,7 +907,7 @@ def main():
     ship_context_cache = {}
     final_rows = []
 
-    print(f"Starting audit with {MODEL_NAME}. Rules: 6K TPM / 60 RPM / 500K Daily.")
+    print(f"Starting audit with {MODEL_NAME}. Rules: 8K TPM / 30 RPM / 200K Daily.")
     tracker.print_limit_status("Starting Limits")
 
     for idx, row in tqdm(df.iterrows(), total=len(df)):
@@ -922,8 +944,9 @@ def main():
                     {"role": "user", "content": get_validation_prompt(row_dict)},
                 ],
                 temperature=0,
-                max_completion_tokens=350,
-                top_p=0.95,
+                max_completion_tokens=1500,
+                top_p=1,
+                reasoning_effort="medium",
                 stream=False,
             )
             tracker.log_request(res.usage.prompt_tokens, res.usage.completion_tokens)
