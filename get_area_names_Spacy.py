@@ -12,7 +12,7 @@ except OSError:
     nlp = spacy.load("en_core_web_md")
 
 # Initialize Geocoder
-geolocator = Nominatim(user_agent="historical_matrix_geocoder_v17")
+geolocator = Nominatim(user_agent="historical_multi_entity_geocoder_v19")
 
 INPUT_FILE = 'notes_sample.xlsx'
 OUTPUT_FILE = 'Extracted_Geographic_Validation.xlsx'
@@ -20,42 +20,34 @@ OUTPUT_FILE = 'Extracted_Geographic_Validation.xlsx'
 # Global cache to prevent redundant API calls
 GEO_CACHE = {}
 
-# List of US States for quick identification
-US_STATES = {
-    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
-    "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", 
-    "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", 
-    "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", 
-    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", 
-    "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota", 
-    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington", "West Virginia", 
-    "Wisconsin", "Wyoming", "District of Columbia"
-}
-
 # --- 2. UTILITY FUNCTIONS ---
 
 def clean_val(val):
-    """Ensures a single value with no commas."""
+    """Ensures a single value with no internal commas."""
     if not val or val == "-":
-        return "-"
+        return None
     return str(val).split(",")[0].strip()
 
-def get_geopy_data_cached(query):
+def get_geopy_data_cached(query, priority_us=False):
     """
-    Fetches location data with rate limiting and 
-    checks global cache to avoid redundant API calls.
+    Fetches location data with rate limiting and caching.
+    Tries US-specific search first if requested.
     """
-    if not query or query == "-":
-        return None
+    cache_key = f"{query}_US" if priority_us else f"{query}_Global"
     
-    # Check if we already looked this up in this session
-    if query in GEO_CACHE:
-        return GEO_CACHE[query]
+    if cache_key in GEO_CACHE:
+        return GEO_CACHE[cache_key]
     
     try:
-        time.sleep(1.1) # Respect Nominatim usage policy
+        time.sleep(1.1) 
+        if priority_us:
+            location = geolocator.geocode(query, addressdetails=True, timeout=10, country_codes='us')
+            if location:
+                GEO_CACHE[cache_key] = location
+                return location
+        
         location = geolocator.geocode(query, addressdetails=True, timeout=10)
-        GEO_CACHE[query] = location # Store in cache
+        GEO_CACHE[cache_key] = location
         return location
     except:
         return None
@@ -64,20 +56,27 @@ def get_geopy_data_cached(query):
 
 def process_record(text):
     """
-    STAGES:
-    1. Extraction & Areas Population.
-    2. US State Detection (Sets Country to US if state found).
-    3. Exhaustive Classification (using Cache).
-    4. Matrix Generation with ' - ' formatting.
+    1. Extraction of all GPE/LOC entities.
+    2. US-First exhaustive classification for every entity.
+    3. Multi-value aggregation (comma-separated within columns).
+    4. Matrix generation for coordinate sets.
     """
     cols = ['Areas', 'Validation', 'City', 'Landmark', 'County', 'State', 'Country', 'Areas_for_coordinates', 'Final_Coordinates']
     res = {k: "-" for k in cols}
+    
+    # Internal lists to hold multiple values per category
+    found_data = {
+        'City': [],
+        'Landmark': [],
+        'County': [],
+        'State': [],
+        'Country': []
+    }
     
     if pd.isna(text) or text == '-':
         return pd.Series([res[k] for k in cols], index=cols)
 
     doc = nlp(str(text))
-    # Extract entities, skipping index 0 (names)
     entities = [ent.text.strip() for ent in doc.ents if ent.label_ in ['GPE', 'LOC'] and ent.start_char > 0]
     
     if not entities:
@@ -86,78 +85,79 @@ def process_record(text):
     res['Areas'] = ", ".join(list(dict.fromkeys(entities)))
     unique_entities = list(dict.fromkeys(entities))
 
-    # --- STAGE 1: US STATE & COUNTRY CHECK ---
-    found_us_state = False
-    for area in unique_entities:
-        if area in US_STATES:
-            res['State'] = area
-            res['Country'] = "United States"
-            found_us_state = True
-            break
-
-    # --- STAGE 2: CLASSIFICATION ---
     val_status = []
-    metadata_list = []
     
+    # --- STAGE 1: EXHAUSTIVE MULTI-VALUE CLASSIFICATION ---
     for area in unique_entities:
-        # If we already identified it as a US State, we still "validate" it
-        loc = get_geopy_data_cached(area)
+        # Check US First
+        loc = get_geopy_data_cached(area, priority_us=True)
+        
         if loc:
             val_status.append("Yes")
-            raw = loc.raw
-            addr = raw.get('address', {})
-            a_type = raw.get('addresstype', '').lower()
-            metadata_list.append(addr)
+            addr = loc.raw.get('address', {})
+            a_type = loc.raw.get('addresstype', '').lower()
+            
+            # Identify high-level country context
+            if addr.get('country_code') == 'us' and "United States" not in found_data['Country']:
+                found_data['Country'].append("United States")
 
-            # Classification assignment
+            # Categorize the specific entity extracted from 'Areas'
             if a_type in ['city', 'town', 'village', 'hamlet', 'municipality', 'suburb']:
-                if res['City'] == "-": res['City'] = clean_val(area)
+                val = clean_val(area)
+                if val and val not in found_data['City']: found_data['City'].append(val)
             elif a_type in ['county', 'district', 'county_district']:
-                if res['County'] == "-": res['County'] = clean_val(area)
+                val = clean_val(area)
+                if val and val not in found_data['County']: found_data['County'].append(val)
             elif a_type in ['state', 'province', 'state_district']:
-                if res['State'] == "-": res['State'] = clean_val(area)
+                val = clean_val(area)
+                if val and val not in found_data['State']: found_data['State'].append(val)
             elif a_type == 'country':
-                if res['Country'] == "-": res['Country'] = clean_val(area)
+                val = clean_val(area)
+                if val and val not in found_data['Country']: found_data['Country'].append(val)
             else:
-                if res['Landmark'] == "-": res['Landmark'] = clean_val(area)
+                val = clean_val(area)
+                if val and val not in found_data['Landmark']: found_data['Landmark'].append(val)
+
+            # Waterfall fill: Extract parent hierarchy from the geocode result
+            g_city = clean_val(addr.get('city') or addr.get('town') or addr.get('village'))
+            g_county = clean_val(addr.get('county'))
+            g_state = clean_val(addr.get('state') or addr.get('province'))
+            g_country = clean_val(addr.get('country'))
+
+            if g_city and g_city not in found_data['City']: found_data['City'].append(g_city)
+            if g_county and g_county not in found_data['County']: found_data['County'].append(g_county)
+            if g_state and g_state not in found_data['State']: found_data['State'].append(g_state)
+            if g_country and g_country not in found_data['Country']: found_data['Country'].append(g_country)
         else:
             val_status.append("No")
 
-    # Waterfall fill gaps
-    for addr in metadata_list:
-        if res['City'] == "-":
-            v = addr.get('city') or addr.get('town') or addr.get('village')
-            if v: res['City'] = clean_val(v)
-        if res['County'] == "-":
-            v = addr.get('county')
-            if v: res['County'] = clean_val(v)
-        if res['State'] == "-":
-            v = addr.get('state') or addr.get('province')
-            if v: res['State'] = clean_val(v)
-        if res['Country'] == "-":
-            v = addr.get('country')
-            if v: res['Country'] = clean_val(v)
+    # Finalize administrative columns (join multi-values with comma)
+    for key in found_data:
+        if found_data[key]:
+            res[key] = ", ".join(found_data[key])
 
     res['Validation'] = ", ".join(val_status)
 
-    # --- STAGE 3: MATRIX GENERATION ---
+    # --- STAGE 2: MATRIX GENERATION ---
     test_queries = []
-    hierarchy = [res['Landmark'], res['City'], res['County'], res['State'], res['Country']]
     
-    # Combination 1: Full Hierarchy (comma-separated)
-    full_str = ", ".join([v for v in hierarchy if v != "-"])
-    if full_str: test_queries.append(full_str)
+    # 1. Full Combined hierarchy (all identified parts)
+    all_parts = []
+    for k in ['Landmark', 'City', 'County', 'State', 'Country']:
+        if found_data[k]: all_parts.extend(found_data[k])
     
-    # Combination 2: Logical Pairs
-    if res['City'] != "-" and res['State'] != "-":
-        test_queries.append(f"{res['City']}, {res['State']}")
-    if res['City'] != "-" and res['Country'] != "-":
-        test_queries.append(f"{res['City']}, {res['Country']}")
+    if all_parts:
+        test_queries.append(", ".join(all_parts))
     
-    # Combination 3: Individual parts
-    for v in hierarchy:
-        if v != "-": test_queries.append(v)
-        
+    # 2. Add individual entities for verification
+    for k in ['Landmark', 'City', 'County', 'State', 'Country']:
+        for item in found_data[k]:
+            # Try item alone
+            test_queries.append(item)
+            # Try item + first found country
+            if found_data['Country']:
+                test_queries.append(f"{item}, {found_data['Country'][0]}")
+
     unique_queries = []
     for q in test_queries:
         if q not in unique_queries: unique_queries.append(q)
@@ -166,15 +166,15 @@ def process_record(text):
     hits_coord = []
     
     for q in unique_queries:
-        loc = get_geopy_data_cached(q) # Uses cache
+        is_us = ("United States" in res['Country'])
+        loc = get_geopy_data_cached(q, priority_us=is_us)
         if loc:
             hits_area.append(q)
             hits_coord.append(f"{loc.latitude}, {loc.longitude}")
 
-    # Formatting with " - " separator
     if hits_area:
-        res['Areas_for_coordinates'] = " - ".join(hits_area)
-        res['Final_Coordinates'] = " - ".join(hits_coord)
+        res['Areas_for_coordinates'] = " -- ".join(hits_area)
+        res['Final_Coordinates'] = " -- ".join(hits_coord)
 
     return pd.Series([res[k] for k in cols], index=cols)
 
@@ -188,18 +188,17 @@ def main():
         print(f"Error: {e}")
         return
 
-    print("Processing records with US State detection and Global Caching...")
+    print("Processing multi-value geographic entities with US-Priority...")
     start_time = time.time()
     
     processed_df = df['Notes'].apply(process_record)
     final_df = pd.concat([df, processed_df], axis=1)
 
-    print(f"Saving to {OUTPUT_FILE}...")
+    print(f"Saving multi-value results to {OUTPUT_FILE}...")
     final_df.to_excel(OUTPUT_FILE, index=False)
     
     end_time = time.time()
-    print(f"Process Complete in {round(end_time - start_time, 2)} seconds.")
-    print(f"Total Unique API queries handled: {len(GEO_CACHE)}")
+    print(f"Finished in {round(end_time - start_time, 2)} seconds.")
 
 if __name__ == "__main__":
     main()
