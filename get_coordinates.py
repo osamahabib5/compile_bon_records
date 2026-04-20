@@ -2,7 +2,7 @@ import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
-df = pd.DataFrame({'Place': ["Charlestown, South Carolina, United States"]})
+df = pd.DataFrame({'Place': ["Wando River, South Carolina"]})
 
 geolocator = Nominatim(user_agent="batch_geocoder")
 
