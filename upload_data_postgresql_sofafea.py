@@ -3,7 +3,6 @@ import psycopg2
 import os
 
 # --- AZURE CONNECTION CONFIGURATION ---
-# Ensure your credentials are correct. URL-encode special characters in the password.
 DB_CONNECTION_STRING = "postgresql://genealogy_user:Bl%40ckLiveSMaTTeR324.@sofafea-postgres.postgres.database.azure.com/postgres?sslmode=require"
 
 def get_db_connection():
@@ -14,24 +13,20 @@ def get_db_connection():
         return None
 
 def format_date(val):
-    """Converts years or strings to valid Postgres DATE format."""
     if pd.isna(val) or str(val).strip() == "" or str(val).lower() == 'nan':
         return None
     try:
-        # Check if it's a year-only integer (e.g., 1776)
         if isinstance(val, (int, float)) or str(val).isdigit():
             return f"{int(float(val))}-01-01"
     except: pass
     return str(val).strip()
 
 def clean_val(val):
-    """Converts NaN to None and strips strings."""
     if pd.isna(val) or str(val).strip() == "" or str(val).lower() == 'nan':
         return None
     return str(val).strip()
 
 def get_or_insert_location(cur, city, county, state, coords, country="United States", landmark="-"):
-    """Normalized location handler with hardcoded defaults."""
     city, county, state, coords = map(clean_val, [city, county, state, coords])
     if not city and not coords: return None
 
@@ -57,35 +52,31 @@ def run_genealogy_ingestion(file_path):
         return
 
     df = pd.read_excel(file_path)
+    df.columns = df.columns.astype(str).str.strip()
+    
     conn = get_db_connection()
     if not conn: return
     cur = conn.cursor()
 
-    # --- BLOCK TRACKING LOGIC ---
     current_gen = 1
-    # These are the parents for the rows currently being processed
     active_parents = {"father": None, "mother": None}
-    # This stores the first couple of the current block to become parents for the NEXT block
     potential_parents_for_next_gen = {"father": None, "mother": None}
-
-    print(f"Starting ingestion. Top rows assigned to Generation {current_gen}...")
+    
+    records_inserted = 0
 
     for i, row in df.iterrows():
-        # Check if the row is empty (Generation Separator)
-        is_empty = row.isnull().all()
-        # Also check if the first cell is a number (alternative separator)
-        is_num_marker = str(row.iloc[0]).strip().isdigit()
-
-        if is_empty or is_num_marker:
-            current_gen += 1
-            # Move the previous block's "first couple" into the active parent slot
-            active_parents = potential_parents_for_next_gen.copy()
-            # Reset potential parents for the new block we are about to enter
-            potential_parents_for_next_gen = {"father": None, "mother": None}
-            print(f"Separator detected. Moving to Generation {current_gen}...")
+        first_name = clean_val(row.get('First_Name'))
+        last_name = clean_val(row.get('Last_Name'))
+        
+        # Generation Break detection
+        if not first_name and not last_name:
+            if potential_parents_for_next_gen['father'] is not None:
+                current_gen += 1
+                active_parents = potential_parents_for_next_gen.copy()
+                potential_parents_for_next_gen = {"father": None, "mother": None}
             continue
 
-        # --- 1. PROCESS SOLDIER ---
+        # --- 1. INSERT SOLDIER ---
         s_loc_id = get_or_insert_location(cur, row.get('City'), row.get('County'), 
                                           row.get('State'), row.get('Coordinates'))
 
@@ -99,7 +90,7 @@ def run_genealogy_ingestion(file_path):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Male') 
             RETURNING member_id
         """, (
-            clean_val(row.get('First_Name')), clean_val(row.get('Last_Name')), clean_val(row.get('Alias')), 
+            first_name, last_name, clean_val(row.get('Alias')), 
             current_gen, active_parents['father'], active_parents['mother'], 
             format_date(row.get('Gen_1_Birth_Date')), s_loc_id, 
             clean_val(row.get('Race')), clean_val(row.get('Ethnicity')), 
@@ -108,7 +99,7 @@ def run_genealogy_ingestion(file_path):
         ))
         soldier_id = cur.fetchone()[0]
 
-        # --- 2. PROCESS SPOUSE ---
+        # --- 2. INSERT SPOUSE ---
         sp_loc_id = get_or_insert_location(cur, row.get('City.1'), row.get('County.1'), 
                                            row.get('State.1'), row.get('Coordinates.1'))
 
@@ -132,15 +123,22 @@ def run_genealogy_ingestion(file_path):
             ))
             spouse_id = cur.fetchone()[0]
 
-        # --- 3. STORE POTENTIAL PARENTS ---
-        # We capture the first couple of this generation to be the parents for the children in the next block
+            # --- 3. LINK SPOUSES ---
+            # Now that both IDs exist, we update both records to point to each other
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (spouse_id, soldier_id))
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (soldier_id, spouse_id))
+
+        # Store potential parents for next block
         if potential_parents_for_next_gen['father'] is None:
             potential_parents_for_next_gen = {"father": soldier_id, "mother": spouse_id}
+        
+        records_inserted += 1
+        print(f"Row {i+2}: Processed {first_name} {last_name} and spouse.")
 
     conn.commit()
     cur.close()
     conn.close()
-    print("Ingestion complete. Family tree successfully reconstructed.")
+    print(f"Ingestion complete. {records_inserted} records linked successfully.")
 
 if __name__ == "__main__":
     run_genealogy_ingestion('Ancestors Database_v2_copy.xlsx')
