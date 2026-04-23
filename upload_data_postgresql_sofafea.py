@@ -16,6 +16,7 @@ def format_date(val):
     if pd.isna(val) or str(val).strip() == "" or str(val).lower() == 'nan':
         return None
     try:
+        # Handles Excel year-only integers
         if isinstance(val, (int, float)) or str(val).isdigit():
             return f"{int(float(val))}-01-01"
     except: pass
@@ -46,6 +47,27 @@ def get_or_insert_location(cur, city, county, state, coords, country="United Sta
     """, (city, county, state, country, landmark, coords))
     return cur.fetchone()[0]
 
+def get_or_insert_member(cur, first_name, last_name, gen, gender):
+    """Prevents duplicate parents by checking name and generation block."""
+    f_name, l_name = clean_val(first_name), clean_val(last_name)
+    if not f_name: return None
+    
+    cur.execute("""
+        SELECT member_id FROM family_members 
+        WHERE (LOWER(first_name) = LOWER(%s)) 
+        AND (LOWER(last_name) IS NOT DISTINCT FROM LOWER(%s)) 
+        AND (generation_number = %s)
+    """, (f_name, l_name, gen))
+    
+    res = cur.fetchone()
+    if res: return res[0]
+    
+    cur.execute("""
+        INSERT INTO family_members (first_name, last_name, generation_number, gender) 
+        VALUES (%s, %s, %s, %s) RETURNING member_id
+    """, (f_name, l_name, gen, gender))
+    return cur.fetchone()[0]
+
 def run_genealogy_ingestion(file_path):
     if not os.path.exists(file_path):
         print(f"File {file_path} not found.")
@@ -59,24 +81,36 @@ def run_genealogy_ingestion(file_path):
     cur = conn.cursor()
 
     current_gen = 1
-    active_parents = {"father": None, "mother": None}
-    potential_parents_for_next_gen = {"father": None, "mother": None}
-    
-    records_inserted = 0
+    # This flag prevents multiple empty rows from incrementing the generation more than once
+    in_empty_gap = False 
 
     for i, row in df.iterrows():
         first_name = clean_val(row.get('First_Name'))
         last_name = clean_val(row.get('Last_Name'))
         
-        # Generation Break detection
+        # --- GENERATION BREAK DETECTION ---
+        # If the row is empty (no first or last name), we hit a generation gap
         if not first_name and not last_name:
-            if potential_parents_for_next_gen['father'] is not None:
+            if not in_empty_gap:
                 current_gen += 1
-                active_parents = potential_parents_for_next_gen.copy()
-                potential_parents_for_next_gen = {"father": None, "mother": None}
+                in_empty_gap = True
+                print(f"--- Moving to Generation {current_gen} ---")
             continue
+        
+        # We are back in a data block
+        in_empty_gap = False
 
-        # --- 1. INSERT SOLDIER ---
+        # --- 1. PROCESS PARENTS (Current Gen - 1) ---
+        # Father and Mother belong to the generation before the current row
+        f_id = get_or_insert_member(cur, row.get('Father_FirstName'), row.get('Father_Surname'), current_gen - 1, 'Male')
+        m_id = get_or_insert_member(cur, row.get('Mother_FirstName'), row.get('Mother_Surname'), current_gen - 1, 'Female')
+
+        # Link parents as spouses
+        if f_id and m_id:
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (m_id, f_id))
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (f_id, m_id))
+
+        # --- 2. INSERT SUBJECT (Soldier/Individual) ---
         s_loc_id = get_or_insert_location(cur, row.get('City'), row.get('County'), 
                                           row.get('State'), row.get('Coordinates'))
 
@@ -91,21 +125,19 @@ def run_genealogy_ingestion(file_path):
             RETURNING member_id
         """, (
             first_name, last_name, clean_val(row.get('Alias')), 
-            current_gen, active_parents['father'], active_parents['mother'], 
+            current_gen, f_id, m_id, 
             format_date(row.get('Gen_1_Birth_Date')), s_loc_id, 
             clean_val(row.get('Race')), clean_val(row.get('Ethnicity')), 
             clean_val(row.get('Military_Service')), clean_val(row.get('Branch')), clean_val(row.get('War')), 
             format_date(row.get('Gen_1_Death_Date')), format_date(row.get('Gen_1_Marriage_Date'))
         ))
-        soldier_id = cur.fetchone()[0]
+        subject_id = cur.fetchone()[0]
 
-        # --- 2. INSERT SPOUSE ---
+        # --- 3. INSERT SUBJECT'S SPOUSE ---
         sp_loc_id = get_or_insert_location(cur, row.get('City.1'), row.get('County.1'), 
                                            row.get('State.1'), row.get('Coordinates.1'))
 
         spouse_first = clean_val(row.get('Gen_1_Spouse_First_Name'))
-        spouse_id = None
-        
         if spouse_first:
             cur.execute("""
                 INSERT INTO family_members (
@@ -123,22 +155,16 @@ def run_genealogy_ingestion(file_path):
             ))
             spouse_id = cur.fetchone()[0]
 
-            # --- 3. LINK SPOUSES ---
-            # Now that both IDs exist, we update both records to point to each other
-            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (spouse_id, soldier_id))
-            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (soldier_id, spouse_id))
+            # Link Subject and Spouse
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (spouse_id, subject_id))
+            cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (subject_id, spouse_id))
 
-        # Store potential parents for next block
-        if potential_parents_for_next_gen['father'] is None:
-            potential_parents_for_next_gen = {"father": soldier_id, "mother": spouse_id}
-        
-        records_inserted += 1
-        print(f"Row {i+2}: Processed {first_name} {last_name} and spouse.")
+        print(f"Row {i+2}: Processed {first_name} {last_name} (Gen {current_gen})")
 
     conn.commit()
     cur.close()
     conn.close()
-    print(f"Ingestion complete. {records_inserted} records linked successfully.")
+    print("Ingestion complete.")
 
 if __name__ == "__main__":
     run_genealogy_ingestion('Ancestors Database_v2_copy.xlsx')
