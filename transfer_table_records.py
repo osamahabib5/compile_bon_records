@@ -6,7 +6,7 @@ import os
 # Example Azure format: postgresql://[user]:[password]@[host]:5432/[dbname]?sslmode=require
 DB_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://your_user:your_password@your-server-name.postgres.database.azure.com:5432/your_database?sslmode=require"
+    "postgresql://genealogy_user:Bl%40ckLiveSMaTTeR324.@sofafea-postgres.postgres.database.azure.com/postgres?sslmode=require"
 )
 
 def get_or_create_location(cursor, city, county, state, country, landmark, coordinates):
