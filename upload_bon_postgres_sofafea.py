@@ -1,13 +1,20 @@
 import pandas as pd
 import psycopg2
 import os
+import time
 from dotenv import load_dotenv
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # Load variables from .env file
 load_dotenv()
 
-# --- AZURE CONNECTION CONFIGURATION ---
+# --- CONNECTION CONFIGURATION ---
 DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
+
+# Initialize Geocoder
+geolocator = Nominatim(user_agent="genealogy_data_ingestor")
+geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
 def get_db_connection():
     if not DB_CONNECTION_STRING:
@@ -20,7 +27,7 @@ def get_db_connection():
         return None
 
 def clean_val(val):
-    """Converts Excel placeholders like NaN, empty strings, and hyphens to None."""
+    """Standardizes Excel placeholders to None."""
     if pd.isna(val):
         return None
     s_val = str(val).strip()
@@ -29,36 +36,52 @@ def clean_val(val):
     return s_val
 
 def format_date(val):
-    """Ensures dates are valid for PostgreSQL or returns None."""
+    """Formats dates for PostgreSQL ingestion."""
     cleaned = clean_val(val)
     if cleaned is None:
         return None
     try:
-        # Handles Excel year-only integers (e.g., 1783 -> 1783-01-01)
         if cleaned.isdigit() and len(cleaned) == 4:
             return f"{cleaned}-01-01"
     except: 
         pass
     return cleaned
 
-def find_coords_in_mapping(row_state, row_country, areas_str, departure_str):
-    """
-    Looks up coordinates in the row-level pipe-separated columns.
-    Target: "[First State from State column], [Country column]"
-    """
-    st = clean_val(row_state)
-    co = clean_val(row_country)
+def fetch_geopy_coords(state, country):
+    """External fallback: retrieves coordinates via Geopy."""
+    st = clean_val(state)
+    co = clean_val(country)
+    
+    # Extract first state name (handles "New York" or "Delaware, Virginia")
+    search_state = st.split(',')[0].strip() if st else None
+    query_parts = [p for p in [search_state, co] if p]
+    
+    if not query_parts:
+        return None
+        
+    query = ", ".join(query_parts)
+    try:
+        location = geocode_service(query)
+        if location:
+            return f"{location.latitude}, {location.longitude}"
+    except Exception as e:
+        print(f"Geopy error for {query}: {e}")
+    return None
+
+def find_coords_in_mapping(state, country, areas_str, departure_str):
+    """Internal Priority: Matches State/Country combination against pipe-separated mappings."""
+    st = clean_val(state)
+    co = clean_val(country)
     areas = clean_val(areas_str)
     deps = clean_val(departure_str)
     
     if not st or not co or not areas or not deps:
-        return "0.0, 0.0"
+        return None
 
-    # Take first state (e.g. "Delaware" from "Delaware, Virginia")
+    # Identify target string (e.g., "New York, United States")
     first_st = st.split(',')[0].strip()
     target = f"{first_st}, {co}"
     
-    # Split the pipe-separated strings into lists
     areas_list = [a.strip() for a in areas.split('|')]
     deps_list = [d.strip() for d in deps.split('|')]
     
@@ -66,31 +89,34 @@ def find_coords_in_mapping(row_state, row_country, areas_str, departure_str):
         if target in areas_list:
             idx = areas_list.index(target)
             if idx < len(deps_list):
-                coord_match = deps_list[idx]
+                coord_match = deps_list[idx].strip()
                 if coord_match and coord_match != "-":
                     return coord_match
     except:
         pass
-        
-    return "0.0, 0.0"
+    return None
 
 def get_or_insert_location(cur, city, county, state, country, landmark, coords, areas_map, deps_map):
-    """Matches the database UNIQUE (city, county, state) constraint and retrieves coordinates."""
+    """Manages location insertion with hierarchical coordinate lookup."""
     city, county, state, country, landmark, coords = map(clean_val, [city, county, state, country, landmark, coords])
     
-    # If coordinates are null, use the internal Areas/Departure mapping
+    # 1. Coordinate Retrieval Logic
     if not coords:
+        # Try Internal Mapping first
         coords = find_coords_in_mapping(state, country, areas_map, deps_map)
-
-    # Final enforcement: coordinates column cannot be empty
+        
+        # Fallback to Geopy if Mapping failed
+        if not coords:
+            coords = fetch_geopy_coords(state, country)
+    
+    # Final default to satisfy NOT NULL constraints
     if not coords:
         coords = "0.0, 0.0"
 
-    # Require at least identifying components
     if not any([city, county, state]):
         return None
 
-    # Check for existing record based on the UNIQUE (city, county, state) constraint
+    # Check for existing location using unique constraint components
     cur.execute("""
         SELECT location_id FROM locations 
         WHERE (city IS NOT DISTINCT FROM %s) 
@@ -102,7 +128,6 @@ def get_or_insert_location(cur, city, county, state, country, landmark, coords, 
     if res:
         return res[0]
 
-    # Insert new record if not found
     cur.execute("""
         INSERT INTO locations (city, county, state, country, landmark, coordinates) 
         VALUES (%s, %s, %s, %s, %s, %s) RETURNING location_id
@@ -110,7 +135,7 @@ def get_or_insert_location(cur, city, county, state, country, landmark, coords, 
     return cur.fetchone()[0]
 
 def get_or_insert_member(cur, first_name, last_name, gen, gender):
-    """Handles tree node insertion while avoiding duplicates."""
+    """Maintains unique records for family tree members."""
     f_name, l_name = clean_val(first_name), clean_val(last_name)
     if not f_name: return None
     
@@ -142,35 +167,11 @@ def run_genealogy_ingestion(file_path):
     if not conn: return
     cur = conn.cursor()
 
-    # Ensure supplemental table exists
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS book_of_negroes (
-            bon_id SERIAL PRIMARY KEY,
-            member_id INTEGER REFERENCES family_members(member_id),
-            excel_id TEXT,
-            book TEXT,
-            ship_name TEXT,
-            notes TEXT,
-            ship_notes TEXT,
-            origin TEXT,
-            areas_for_coordinates TEXT,
-            departure_port TEXT,
-            departure_date TEXT,
-            ref_page TEXT,
-            commander TEXT,
-            enslaver TEXT,
-            primary_source_1 TEXT,
-            primary_source_2 TEXT,
-            arrival_location_id INTEGER REFERENCES locations(location_id)
-        )
-    """)
-
     for i, row in df.iterrows():
-        # Source columns for coordinate mapping
         areas_map = row.get('Areas_for_coordinates')
         deps_map = row.get('Departure_Coordinates')
 
-        # 1. Generation Logic
+        # 1. Determine Generation
         has_grand = clean_val(row.get('GrandMother_FirstName')) or clean_val(row.get('GrandMother_Surname'))
         has_parents = any([clean_val(row.get('Father_FirstName')), clean_val(row.get('Mother_FirstName'))])
         
@@ -181,19 +182,18 @@ def run_genealogy_ingestion(file_path):
         else:
             sub_gen, p_gen, g_gen = 1, None, None
 
-        # 2. Process Family Tree Nodes
+        # 2. Ancestor Processing
         gm_id = get_or_insert_member(cur, row.get('GrandMother_FirstName'), row.get('GrandMother_Surname'), g_gen, 'Female') if g_gen else None
         f_id = get_or_insert_member(cur, row.get('Father_FirstName'), row.get('Father_Surname'), p_gen, 'Male') if p_gen else None
         m_id = get_or_insert_member(cur, row.get('Mother_FirstName'), row.get('Mother_Surname'), p_gen, 'Female') if p_gen else None
 
         if m_id and gm_id:
             cur.execute("UPDATE family_members SET mother_id = %s WHERE member_id = %s", (gm_id, m_id))
-
         if f_id and m_id:
             cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (m_id, f_id))
             cur.execute("UPDATE family_members SET spouse_id = %s WHERE member_id = %s", (f_id, m_id))
 
-        # 3. Process Locations (Passing coordinate list mapping)
+        # 3. Location Ingestion
         loc_id = get_or_insert_location(cur, row.get('City'), row.get('County'), row.get('State'), 
                                         row.get('Country'), row.get('Landmark'), row.get('Final_Coordinates'),
                                         areas_map, deps_map)
@@ -202,7 +202,7 @@ def run_genealogy_ingestion(file_path):
                                             row.get('Arrival_Port_Country'), None, row.get('Arrival_Coordinates'),
                                             areas_map, deps_map)
 
-        # 4. Insert Subject Record
+        # 4. Subject Ingestion
         cur.execute("""
             INSERT INTO family_members (
                 first_name, last_name, alias, generation_number, 
@@ -218,7 +218,7 @@ def run_genealogy_ingestion(file_path):
         ))
         subject_id = cur.fetchone()[0]
 
-        # 5. Populate Supplemental Table
+        # 5. Metadata Ingestion
         cur.execute("""
             INSERT INTO book_of_negroes (
                 member_id, excel_id, book, ship_name, notes, ship_notes, 
@@ -244,4 +244,4 @@ def run_genealogy_ingestion(file_path):
     print("Ingestion complete.")
 
 if __name__ == "__main__":
-    run_genealogy_ingestion('Consolidated_Book_of_Negroes_v11_subset.xlsx')
+    run_genealogy_ingestion('Consolidated_Book_of_Negroes_v11.xlsx')
