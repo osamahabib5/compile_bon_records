@@ -4,34 +4,43 @@ from geopy.extra.rate_limiter import RateLimiter
 import os
 
 # --- SETTINGS ---
-INPUT_FILE = 'USCTs_Connecticut_rev_02_copy.xlsx'
-OUTPUT_FILE = 'USCTs_Connecticut_rev_03.xlsx'
+INPUT_FILE = 'USCTs_Connecticut_rev_03.xlsx'
+OUTPUT_FILE = 'USCTs_Connecticut_rev_03_copy.xlsx'
 
 def get_modified_lineage_data():
     if not os.path.exists(INPUT_FILE):
         print(f"Error: {INPUT_FILE} not found.")
         return
 
-    # Load the Excel file
     df = pd.read_excel(INPUT_FILE)
     
     # Verify required columns exist
-    required = ['Residence_City', 'Residence_State', 'Place_of_birth']
+    required = ['Residence_City', 'Residence_State', 'Enlistment_City', 'Enlistment_State', 'Place_of_birth']
     for col in required:
         if col not in df.columns:
             print(f"Error: Column '{col}' not found in the file.")
             return
 
-    # --- Geocoding Setup ---
-    geolocator = Nominatim(user_agent="genealogy_mapper_v4")
-    # Rate limiter set to 1.5s to be safe with Nominatim's usage policy
+    # Initialize Geocoder
+    geolocator = Nominatim(user_agent="genealogy_mapper_v5", timeout=10)
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.5)
 
-    # Caches to prevent duplicate API calls for identical locations
-    res_cache = {}   # (city, state) -> (county, country, coords)
-    birth_cache = {} # place_string -> coords
+    # Global cache for (City, State) pairs to be used across both Residence and Enlistment
+    location_cache = {} # (city, state) -> (county, country, coords)
+    birth_cache = {}    # place_string -> coords
 
-    def process_residence(city, state):
+    # Pre-populate cache with any existing data in the file to avoid re-querying
+    if 'Residence_coordinates' in df.columns:
+        for idx, row in df.iterrows():
+            key = (str(row['Residence_City']).strip(), str(row['Residence_State']).strip())
+            if pd.notna(row['Residence_coordinates']) and key not in location_cache:
+                location_cache[key] = (
+                    row.get('Residence_County'), 
+                    row.get('Residence_Country'), 
+                    row['Residence_coordinates']
+                )
+
+    def fetch_geodata(city, state):
         city = str(city).strip() if pd.notna(city) else ""
         state = str(state).strip() if pd.notna(state) else ""
         
@@ -39,82 +48,105 @@ def get_modified_lineage_data():
             return None, None, None
             
         key = (city, state)
-        if key in res_cache:
-            return res_cache[key]
+        if key in location_cache:
+            return location_cache[key]
 
-        # 1. Try USA first using structured query
         try:
+            # Try structured USA query first
             location = geocode(query={'city': city, 'state': state, 'country': 'USA'}, addressdetails=True)
-            
-            # 2. If not found in USA, try global search
             if not location:
                 location = geocode(query={'city': city, 'state': state}, addressdetails=True)
             
             if location:
                 addr = location.raw.get('address', {})
+                # Extract specific administrative levels
                 county = addr.get('county', '')
                 country = addr.get('country', '')
                 coords = f"{location.latitude}, {location.longitude}"
                 
-                res_cache[key] = (county, country, coords)
+                location_cache[key] = (county, country, coords)
                 return county, country, coords
         except Exception as e:
-            print(f"Error geocoding Residence ({city}, {state}): {e}")
+            print(f"Error geocoding ({city}, {state}): {e}")
         
-        res_cache[key] = (None, None, None)
+        location_cache[key] = (None, None, None)
         return None, None, None
 
-    def process_birth(place):
-        place = str(place).strip() if pd.notna(place) else ""
-        if not place:
-            return None
-            
-        if place in birth_cache:
-            return birth_cache[place]
-            
-        try:
-            location = geocode(place)
-            if location:
-                coords = f"{location.latitude}, {location.longitude}"
-                birth_cache[place] = coords
-                return coords
-        except Exception as e:
-            print(f"Error geocoding Birth Place ({place}): {e}")
-            
-        birth_cache[place] = None
-        return None
+    # Lists to store the new column data
+    res_counties, res_countries, res_coords = [], [], []
+    en_counties, en_countries, en_coords = [], [], []
+    birth_coords = []
 
-    # --- Processing Data ---
-    print("Geocoding Residence and Birth data (this may take time due to rate limits)...")
-    
-    # We use a temporary list to avoid changing df size during iteration
-    res_results = [process_residence(c, s) for c, s in zip(df['Residence_City'], df['Residence_State'])]
-    birth_results = [process_birth(p) for p in df['Place_of_birth']]
+    print("Processing records... This may take time due to API rate limits.")
 
-    # Extract results into individual lists
-    counties, countries, res_coords = zip(*res_results)
+    for idx, row in df.iterrows():
+        # 1. Process Residence
+        # Skip API if Residence_coordinates is already populated
+        if 'Residence_coordinates' in df.columns and pd.notna(row['Residence_coordinates']):
+            r_county, r_country, r_coord = row.get('Residence_County'), row.get('Residence_Country'), row['Residence_coordinates']
+        else:
+            r_county, r_country, r_coord = fetch_geodata(row['Residence_City'], row['Residence_State'])
+        
+        res_counties.append(r_county)
+        res_countries.append(r_country)
+        res_coords.append(r_coord)
+
+        # 2. Process Enlistment
+        e_city = str(row['Enlistment_City']).strip()
+        e_state = str(row['Enlistment_State']).strip()
+        r_city = str(row['Residence_City']).strip()
+        r_state = str(row['Residence_State']).strip()
+
+        # Check if Enlistment matches Residence for this row
+        if e_city == r_city and e_state == r_state:
+            en_counties.append(r_county)
+            en_countries.append(r_country)
+            en_coords.append(r_coord)
+        else:
+            e_county, e_country, e_coord = fetch_geodata(e_city, e_state)
+            en_counties.append(e_county)
+            en_countries.append(e_country)
+            en_coords.append(e_coord)
+
+        # 3. Process Birth
+        p_birth = str(row['Place_of_birth']).strip() if pd.notna(row['Place_of_birth']) else ""
+        if not p_birth:
+            birth_coords.append(None)
+        elif p_birth in birth_cache:
+            birth_coords.append(birth_cache[p_birth])
+        else:
+            try:
+                loc = geocode(p_birth)
+                b_coord = f"{loc.latitude}, {loc.longitude}" if loc else None
+                birth_cache[p_birth] = b_coord
+                birth_coords.append(b_coord)
+            except:
+                birth_coords.append(None)
 
     # --- Column Reorganization ---
-    # 1. Insert Residence columns
-    # Find position of Residence_City to place County after it
-    city_idx = df.columns.get_loc('Residence_City')
-    df.insert(city_idx + 1, 'Residence_County', counties)
-    
-    # Find position of Residence_State (now shifted by 1) to place Country/Coords next to it
-    state_idx = df.columns.get_loc('Residence_State')
-    df.insert(state_idx + 1, 'Residence_Country', countries)
-    df.insert(state_idx + 2, 'Residence_coordinates', res_coords)
+    # Helper to safely insert columns
+    def safe_insert(df, after_col, new_col_name, data):
+        if new_col_name in df.columns:
+            df[new_col_name] = data # Update if exists
+        else:
+            idx = df.columns.get_loc(after_col)
+            df.insert(idx + 1, new_col_name, data)
 
-    # 2. Insert Birth column
-    birth_idx = df.columns.get_loc('Place_of_birth')
-    df.insert(birth_idx + 1, 'Birth_coordinates', birth_results)
+    # Residence Inserts
+    safe_insert(df, 'Residence_City', 'Residence_County', res_counties)
+    safe_insert(df, 'Residence_State', 'Residence_Country', res_countries)
+    safe_insert(df, 'Residence_Country', 'Residence_coordinates', res_coords)
 
-    # --- Save Result ---
-    try:
-        df.to_excel(OUTPUT_FILE, index=False)
-        print(f"Success! Result saved to: {OUTPUT_FILE}")
-    except Exception as e:
-        print(f"Error saving file: {e}")
+    # Enlistment Inserts
+    safe_insert(df, 'Enlistment_City', 'Enlistment_County', en_counties)
+    safe_insert(df, 'Enlistment_State', 'Enlistment_Country', en_countries)
+    safe_insert(df, 'Enlistment_Country', 'Enlistment_Coordinates', en_coords)
+
+    # Birth Insert
+    safe_insert(df, 'Place_of_birth', 'Birth_coordinates', birth_coords)
+
+    df.to_excel(OUTPUT_FILE, index=False)
+    print(f"Success! Result saved to: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     get_modified_lineage_data()

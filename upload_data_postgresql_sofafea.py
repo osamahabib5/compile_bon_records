@@ -1,9 +1,14 @@
 import pandas as pd
 import psycopg2
 import os
+from dotenv import load_dotenv  # New import
+
+# Load variables from .env file
+load_dotenv()
 
 # --- AZURE CONNECTION CONFIGURATION ---
-DB_CONNECTION_STRING = "postgresql://genealogy_user:Bl%40ckLiveSMaTTeR324.@sofafea-postgres.postgres.database.azure.com/postgres?sslmode=require"
+# Get the connection string from the environment variable
+DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
 
 def get_db_connection():
     try:
