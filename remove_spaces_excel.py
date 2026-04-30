@@ -3,7 +3,7 @@ import re
 
 def clean_excel_columns(input_file, output_file):
     # Load the Excel file
-    df = pd.read_excel(input_file)
+    excel_file = pd.ExcelFile(input_file)
     
     # Define a function to clean strings
     def clean_name(name):
@@ -13,12 +13,15 @@ def clean_excel_columns(input_file, output_file):
         # Optional: Remove leading/trailing underscores and double underscores
         return cleaned.strip('_').replace('__', '_')
 
-    # Rename the columns
-    df.columns = [clean_name(col) for col in df.columns]
-    
-    # Save to a new Excel file
-    df.to_excel(output_file, index=False)
+    # Process all sheets
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        for sheet_name in excel_file.sheet_names:
+            df = pd.read_excel(input_file, sheet_name=sheet_name)
+            # Rename the columns
+            df.columns = [clean_name(col) for col in df.columns]
+            # Save to Excel file
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
     print(f"Cleaned file saved as: {output_file}")
 
 # Usage
-clean_excel_columns('USCTs_Connecticut_rev_02_copy.xlsx', 'USCTs_Connecticut_rev_02_copy.xlsx')
+clean_excel_columns('Database_template_records_insertion_JO_Attaquin_copy.xlsx', 'Database_template_records_insertion_JO_Attaquin_v1.xlsx')

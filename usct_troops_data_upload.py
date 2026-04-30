@@ -210,4 +210,4 @@ def run_usct_ingestion(file_path):
 
 if __name__ == "__main__":
     # Update with your local Excel file path
-    run_usct_ingestion('USCT_Connecticut_Data.xlsx')
+    run_usct_ingestion('USCTs_Connecticut_rev_05_copy.xlsx')
